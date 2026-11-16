@@ -30,9 +30,10 @@ immutable `Cache-Control` is set on
 hits, a short one on 404s (so a bad/unknown path or host doesn't hammer
 KV/R2 on every repeat request), and every response — including errors —
 carries permissive read CORS since this only ever serves public assets, and
-`X-Content-Type-Options: nosniff`. HTML, SVG and XML objects are also sent with
-`Content-Disposition: attachment` and `Content-Security-Policy: sandbox`
-(`mediaResponse` in `src/index.js`).
+`X-Content-Type-Options: nosniff`. Every response except a plain PDF also carries
+`Content-Security-Policy: sandbox` (an `<img>`/`<video>`/`<audio>` embed ignores it).
+HTML, SVG, XML and multipart objects, and any comma-joined content-type, are also sent
+with `Content-Disposition: attachment` (`mediaResponse` in `src/index.js`).
 
 ## Soft delete (hub#222)
 

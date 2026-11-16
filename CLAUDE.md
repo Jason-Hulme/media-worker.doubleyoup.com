@@ -90,9 +90,10 @@ This is effectively a one-file Worker:
   CORS down without checking this reasoning first.
 - **Every response is built by `mediaResponse()`** (policy rule
   `dy-media-response-headers` blocks any other `new Response(`). It adds CORS and
-  `x-content-type-options: nosniff` always, and `content-disposition: attachment` +
-  `content-security-policy: sandbox` for HTML/SVG/XML: every tenant shares the shared
-  host's origin.
+  `x-content-type-options: nosniff` always, `content-security-policy: sandbox` on every
+  response except a plain PDF (Chrome will not show a sandboxed PDF), and
+  `content-disposition: attachment` for HTML/SVG/XML/multipart or a comma-joined type:
+  every tenant shares the shared host's origin, and the active-type list is a blocklist.
 - **Only `siteSlugFromPrefixSegment()` maps an `sg-` prefix** (policy rule
   `dy-derived-slot-name`).
 - Content-type is read from the S3 response's `content-type` first;

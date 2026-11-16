@@ -71,9 +71,11 @@ function assertBaseSafetyHeaders(response) {
   assert.equal(response.headers.get("access-control-allow-origin"), "*");
 }
 
+// Passive media stays inline (no attachment) but still carries the sandbox CSP: an
+// <img>/<video>/<audio> embed ignores it, and a page opened from it cannot run script.
 function assertInlineAllowed(response) {
   assert.equal(response.headers.get("content-disposition"), null);
-  assert.equal(response.headers.get("content-security-policy"), null);
+  assert.equal(response.headers.get("content-security-policy"), "sandbox");
 }
 
 function assertSandboxedDownload(response) {
@@ -114,6 +116,9 @@ const activeContentTypes = [
   // Comma-joined: a browser takes the last type, so this renders as HTML.
   "image/png, text/html",
   "image/png,text/html; charset=utf-8",
+  // Rendered part by part, each part with its own content-type, so a part can be HTML.
+  "multipart/x-mixed-replace; boundary=b",
+  "Multipart/Mixed; boundary=b",
 ];
 
 for (const contentType of activeContentTypes) {
@@ -128,6 +133,19 @@ test("mediaResponse sets nosniff when there is no content-type at all", () => {
   const response = mediaResponse(null, { status: 404, headers: new Headers() });
   assertBaseSafetyHeaders(response);
   assertInlineAllowed(response);
+});
+
+test("mediaResponse leaves a plain PDF inline and unsandboxed (Chrome will not show a sandboxed PDF)", () => {
+  const response = mediaResponse("x", { status: 200, headers: new Headers({ "content-type": "application/pdf" }) });
+  assertBaseSafetyHeaders(response);
+  assert.equal(response.headers.get("content-disposition"), null);
+  assert.equal(response.headers.get("content-security-policy"), null);
+});
+
+test("mediaResponse sends a comma-joined type that starts with PDF as a sandboxed download", () => {
+  const response = mediaResponse("x", { status: 200, headers: new Headers({ "content-type": "application/pdf, text/html" }) });
+  assertBaseSafetyHeaders(response);
+  assertSandboxedDownload(response);
 });
 
 // ── every handler response path ──────────────────────────────────────────────
@@ -154,6 +172,22 @@ test("200 comma-joined content-type ending in HTML: sandboxed download", async (
   assert.equal(response.status, 200);
   assertBaseSafetyHeaders(response);
   assertSandboxedDownload(response);
+});
+
+test("200 multipart/x-mixed-replace stored as x.png: sandboxed download", async () => {
+  stubUpstream([objectResponse(200, { "content-type": "multipart/x-mixed-replace; boundary=b" })]);
+  const response = await worker.fetch(new Request(`https://media.doubleyoup.com/${SLUG}/x.png`), ENV);
+  assert.equal(response.status, 200);
+  assertBaseSafetyHeaders(response);
+  assertSandboxedDownload(response);
+});
+
+test("200 unknown tenant-chosen type: inline but sandboxed", async () => {
+  stubUpstream([objectResponse(200, { "content-type": "application/x-made-up" })]);
+  const response = await worker.fetch(new Request(`https://media.doubleyoup.com/${SLUG}/x.bin`), ENV);
+  assert.equal(response.status, 200);
+  assertBaseSafetyHeaders(response);
+  assertInlineAllowed(response);
 });
 
 test("200 SVG with no stored content-type (extension fallback): sandboxed download", async () => {

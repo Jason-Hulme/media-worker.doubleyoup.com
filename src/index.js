@@ -279,8 +279,23 @@ function isActiveDocumentContentType(contentType) {
   if (contentType.includes(",")) return true;
   const mediaType = mediaTypeOf(contentType);
   if (ACTIVE_DOCUMENT_CONTENT_TYPES.has(mediaType)) return true;
+  // multipart/x-mixed-replace (and any other multipart type) can be rendered part by part,
+  // each part with its own content-type, so a part can be HTML.
+  if (mediaType.startsWith("multipart/")) return true;
   // Any other XML-based type (application/rss+xml, application/atom+xml, ...).
   return mediaType.endsWith("+xml");
+}
+
+// The list above is a blocklist and cannot name every type some browser renders as a page,
+// so content-security-policy: sandbox goes on EVERY response, not only on the active types.
+// It has no effect on <img>/<video>/<audio> embeds. The one exception is a plain PDF: Chrome
+// refuses to show a sandboxed PDF, and its PDF viewer runs in its own origin, not in the
+// media origin, so a PDF cannot run script here anyway.
+function needsSandbox(contentType) {
+  if (!contentType) return true;
+  if (contentType.includes(",")) return true;
+  const isPlainPdf = mediaTypeOf(contentType) === "application/pdf";
+  return !isPlainPdf;
 }
 
 // THE ONLY place a Response is built (policy rule dy-media-response-headers enforces it), so
@@ -290,17 +305,23 @@ function isActiveDocumentContentType(contentType) {
 //     opaque CORS error in the console.
 //   • x-content-type-options: nosniff — a browser must not guess an active type from the
 //     bytes of an object stored as (or falling back to) a passive or unknown type.
-//   • for an active document type (see above): content-disposition: attachment and
-//     content-security-policy: sandbox, so opening it downloads it, and if it is rendered
-//     anyway it runs in an opaque origin with scripts off. <img src="x.svg"> embeds are
-//     unaffected: an image embed ignores both headers.
+//   • content-security-policy: sandbox on every response except a plain PDF (see
+//     needsSandbox), so anything a browser renders as a page runs in an opaque origin with
+//     scripts off.
+//   • for an active document type (see above): also content-disposition: attachment, so
+//     opening it downloads it. <img src="x.svg"> embeds are unaffected: an image embed
+//     ignores both headers.
 // Exported (like the bucket helpers) purely so it is unit-testable.
 export function mediaResponse(body, { status, headers }) {
   const responseHeaders = new Headers(headers);
   responseHeaders.set("access-control-allow-origin", "*");
   responseHeaders.set("x-content-type-options", "nosniff");
 
-  if (isActiveDocumentContentType(responseHeaders.get("content-type"))) {
+  const contentType = responseHeaders.get("content-type");
+  if (needsSandbox(contentType)) {
+    responseHeaders.set("content-security-policy", "sandbox");
+  }
+  if (isActiveDocumentContentType(contentType)) {
     responseHeaders.set("content-disposition", "attachment");
     responseHeaders.set("content-security-policy", "sandbox");
   }

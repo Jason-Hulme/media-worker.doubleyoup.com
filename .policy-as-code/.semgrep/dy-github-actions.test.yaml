@@ -1,0 +1,83 @@
+# Fixture for dy-github-actions.yaml (hub#495 rule B8). semgrep test reads it; GitHub never runs it.
+name: fixture
+on:
+  pull_request_target:
+  workflow_run:
+    workflows: [build]
+    types: [completed]
+
+permissions:
+  contents: read
+
+jobs:
+  fixture:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # ruleid: dy-gha-target-code-checkout
+          ref: ${{ github.event.pull_request.head.sha }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: ${{ github.event.workflow_run.head_repository.full_name }}
+          # ruleid: dy-gha-target-code-checkout
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # ruleid: dy-gha-target-code-checkout
+          ref: ${{ github.head_ref }}
+
+      - name: a named step, with the PR head as a fallback expression
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          path: target
+          # ruleid: dy-gha-target-code-checkout
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          # ok: dy-gha-target-code-checkout
+          ref: ${{ github.event.pull_request.base.sha }}
+          persist-credentials: false
+
+      # ok: dy-gha-target-code-checkout
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      # ruleid: dy-gha-run-shell-injection
+      - run: echo "${{ github.event.pull_request.title }}"
+
+      - name: multi-line
+        # ruleid: dy-gha-run-shell-injection
+        run: |
+          set -eu
+          git switch "${{ github.head_ref }}"
+
+      # ruleid: dy-gha-run-shell-injection
+      - run: echo '${{ toJSON(github) }}'
+
+      # ruleid: dy-gha-run-shell-injection
+      - run: echo "${{ github['event'].issue.body }}"
+
+      # ok: dy-gha-run-shell-injection
+      - run: echo "$TITLE"
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+
+      # ok: dy-gha-run-shell-injection
+      - run: echo "${{ github.sha }} ${{ github.repository }}"
+
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        with:
+          # ruleid: dy-gha-github-script-injection
+          script: |
+            console.log("${{ github.event.issue.title }}")
+
+      - uses: actions/github-script@60a0d83039c74a4aee543508d2ffcb1c3799cdea # v7
+        env:
+          TITLE: ${{ github.event.issue.title }}
+        with:
+          # ok: dy-gha-github-script-injection
+          script: |
+            console.log(process.env.TITLE)

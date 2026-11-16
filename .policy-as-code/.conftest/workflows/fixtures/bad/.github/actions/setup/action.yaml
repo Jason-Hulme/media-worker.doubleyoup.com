@@ -1,0 +1,7 @@
+# BAD fixture (hub#495 rule gap A2): a local composite action runs with the token of the job
+# that calls it, so its tag-pinned step must be denied.
+name: setup
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-node@v4

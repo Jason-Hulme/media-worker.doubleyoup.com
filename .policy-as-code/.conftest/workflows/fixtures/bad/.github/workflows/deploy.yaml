@@ -1,0 +1,19 @@
+# BAD fixture (hub#495 rule gap A1). It must FAIL `scripts/conftest.sh verify`'s fixture check.
+# The .yaml spelling is the point: scripts/conftest.sh once globbed only *.yml, so this file
+# was never checked. It also calls a reusable workflow by tag and runs a mutable docker:// tag
+# in an id-token job (rule gap A2).
+on: push
+permissions:
+  id-token: write
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: google-github-actions/auth@v2
+      - uses: docker://alpine:3.20
+      - uses: ./.github/actions/setup
+      - uses: ./.github/actions/deploy/gcp
+  call:
+    permissions:
+      id-token: write
+    uses: example-org/shared/.github/workflows/deploy.yml@v1

@@ -28,6 +28,21 @@ const realWarn = console.warn;
 let upstreamCalls;
 let warnings;
 
+// A HOSTMAP stub that maps hostnames to slugs and holds the given "migrated:<slug>" flags.
+// Any other key reads as absent, like a real KV namespace.
+function hostmapWith({ hostSlug = null, migratedSlugs = [] } = {}) {
+  return {
+    get: async (kvKey) => {
+      if (kvKey.startsWith("migrated:")) {
+        const slug = kvKey.slice("migrated:".length);
+        if (migratedSlugs.includes(slug)) return "1";
+        return null;
+      }
+      return hostSlug;
+    },
+  };
+}
+
 // Queue one canned R2 response per expected upstream attempt, in order.
 function stubUpstream(responses) {
   const queue = [...responses];
@@ -225,7 +240,7 @@ test("conditional headers are forwarded AND signed on both attempts (304 passthr
 
 test("branded hosts get the same fallback, with the slug from HOSTMAP", async () => {
   stubUpstream([s3ErrorResponse(404, "NoSuchBucket"), objectResponse(200)]);
-  const brandedEnv = { ...ENV, HOSTMAP: { get: async () => SLUG } };
+  const brandedEnv = { ...ENV, HOSTMAP: hostmapWith({ hostSlug: SLUG }) };
 
   const request = new Request(`https://media.rareepicgamer.zone/${OBJECT_PATH}`);
   const response = await worker.fetch(request, brandedEnv);
@@ -249,7 +264,7 @@ for (const route of dotSegmentRoutes) {
     for (const method of ["GET", "HEAD"]) {
       test(`${method} ${route.name} refuses decoded ${encodedSegment} before any R2 read`, async () => {
         stubUpstream([]);
-        const env = { ...ENV, HOSTMAP: { get: async () => SLUG } };
+        const env = { ...ENV, HOSTMAP: hostmapWith({ hostSlug: SLUG }) };
         const request = new Request(`${route.baseUrl}/${encodedSegment}trash/2026-11-02/${OBJECT_PATH}`, { method });
 
         const response = await worker.fetch(request, env);
@@ -309,7 +324,7 @@ test("a root trash key on the shared host (trash in the slug position) is a 404 
 
 test("trash on a branded host is a 404 with no R2 call", async () => {
   stubUpstream([]);
-  const brandedEnv = { ...ENV, HOSTMAP: { get: async () => SLUG } };
+  const brandedEnv = { ...ENV, HOSTMAP: hostmapWith({ hostSlug: SLUG }) };
   const request = new Request(`https://media.rareepicgamer.zone/trash/2026-11-02/${OBJECT_PATH}`);
 
   const response = await worker.fetch(request, brandedEnv);
@@ -577,7 +592,7 @@ test("an env-id-suffixed slug falls back to its live key", async () => {
 });
 
 test("a branded host miss makes exactly the same two reads as before", async () => {
-  const brandedEnv = { ...ENV, HOSTMAP: { get: async () => "acme" } };
+  const brandedEnv = { ...ENV, HOSTMAP: hostmapWith({ hostSlug: "acme" }) };
   stubUpstream([s3ErrorResponse(404, "NoSuchKey"), s3ErrorResponse(404, "NoSuchKey")]);
 
   const response = await worker.fetch(new Request("https://media.customer.example/2026/11/x.png"), brandedEnv);

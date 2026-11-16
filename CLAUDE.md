@@ -59,6 +59,9 @@ This is effectively a one-file Worker:
   must propagate (never mask a real outage with a second lookup that could 404), and
   the fallback's response is passed to `buildClientResponse` untouched so a 401/403
   there surfaces as a 500 rather than a 60s-cached 404.
+- **A `migrated:<slug>` key in `HOSTMAP` turns the fallback off for that slug.** The
+  key is read only after a primary 404/401/403, never on a primary 200. Without it, a
+  soft-deleted object of a migrated site would be served from its old shared-bucket copy.
 - **The fallback path logs; the happy paths don't.** Two `console.warn` lines exist
   because a fallback 404 is otherwise indistinguishable from "object missing":
   `fallback-auth-denied` (primary answered 401/403 — the alarm for a broken per-site
@@ -85,6 +88,13 @@ This is effectively a one-file Worker:
   including 404/405/400/500 — so a broken `<img>`/`<video>` src fails as a
   clean HTTP error in devtools rather than an opaque CORS error. Don't scope
   CORS down without checking this reasoning first.
+- **Every response is built by `mediaResponse()`** (policy rule
+  `dy-media-response-headers` blocks any other `new Response(`). It adds CORS and
+  `x-content-type-options: nosniff` always, and `content-disposition: attachment` +
+  `content-security-policy: sandbox` for HTML/SVG/XML: every tenant shares the shared
+  host's origin.
+- **Only `siteSlugFromPrefixSegment()` maps an `sg-` prefix** (policy rule
+  `dy-derived-slot-name`).
 - Content-type is read from the S3 response's `content-type` first;
   `EXT_CONTENT_TYPES` in `src/index.js` is only a fallback for objects stored
   without a content-type.

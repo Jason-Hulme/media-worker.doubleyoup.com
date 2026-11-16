@@ -1,0 +1,30 @@
+# Rule C18: every response this Worker sends is built by mediaResponse() in src/index.js.
+#
+# THE HAZARD. All sites on the shared media host share one origin. A tenant's HTML or SVG served
+# inline there runs script on the origin that serves every other tenant's media. mediaResponse()
+# always sets `x-content-type-options: nosniff` and CORS, and for an HTML/SVG/XML type it adds
+# `content-disposition: attachment` and `content-security-policy: sandbox`. A Response built
+# anywhere else skips those headers.
+rules:
+  - id: dy-media-response-headers
+    message: >-
+      A Response is built outside mediaResponse(). Build every response with
+      mediaResponse(body, { status, headers }) in src/index.js, so it gets nosniff, CORS, and the
+      attachment + sandbox headers for HTML/SVG/XML content.
+    severity: ERROR
+    languages: [javascript]
+    paths:
+      include:
+        - "/src/"
+        - "dy-media-response-headers.js"
+      exclude:
+        - "*.test.js"
+    patterns:
+      - pattern-either:
+          - pattern: new Response(...)
+          - pattern: Response.json(...)
+          - pattern: Response.redirect(...)
+      - pattern-not-inside: |
+          function mediaResponse(...) { ... }
+      - pattern-not-inside: |
+          export function mediaResponse(...) { ... }

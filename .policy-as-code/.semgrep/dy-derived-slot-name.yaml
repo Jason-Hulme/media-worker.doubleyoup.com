@@ -1,0 +1,47 @@
+# Rule C11: the staging prefix "sg-" is derived from, or stripped off, a slug in ONE helper.
+#
+# THE HAZARD. A staging copy and a live site share one name space: on the shared media host the
+# first path segment is either a live slug or "sg-<live slug>". siteSlugFromPrefixSegment() in
+# src/index.js is the one place that maps a "sg-" segment to its live slug (and so to the bucket
+# that is read). A second hand-written "sg-" mapping, or a hand-built "-staging"/"-dev<N>" slot
+# name, can disagree with it and read or serve another site's bucket.
+#
+# WHAT IT MATCHES. Building a slot name from a value ("sg-" + slug, `sg-${slug}`, slug + "-staging",
+# `${slug}-dev${n}`) and parsing one by hand (x.startsWith("sg-"), a /^sg-/ regex). The helper and
+# the one STAGING_PREFIX_PATTERN constant it uses are excluded. A fixed string that only mentions
+# staging ("--no-staging", `msg-${slug}`) does not match.
+rules:
+  - id: dy-derived-slot-name
+    message: >-
+      A staging or dev slot name is built or parsed by hand. Live slugs and slot names share one name
+      space, so map a "sg-" prefix only with siteSlugFromPrefixSegment() (and STAGING_PREFIX_PATTERN)
+      in src/index.js.
+    severity: ERROR
+    languages: [javascript]
+    paths:
+      include:
+        - "/src/"
+        - "dy-derived-slot-name.js"
+      exclude:
+        - "*.test.js"
+    patterns:
+      - pattern-either:
+          - patterns:
+              - pattern: "`$...BEFORE${$VALUE}$...AFTER`"
+              - pattern-regex: \$\{[^}`]+\}-(staging\b|dev(\$\{|[0-9]))
+          - patterns:
+              - pattern: "`$...BEFORE${$VALUE}$...AFTER`"
+              - pattern-regex: (^|[^a-z0-9])sg-\$\{
+          - pattern: $VALUE + "-staging"
+          - pattern: '$VALUE + "-dev" + $N'
+          - pattern: '"sg-" + $VALUE'
+          - pattern: "'sg-' + $VALUE"
+          - pattern: $VALUE.startsWith("sg-")
+          - pattern: $VALUE.startsWith('sg-')
+          - pattern-regex: /\^sg-
+      - pattern-not-inside: |
+          function siteSlugFromPrefixSegment(...) { ... }
+      - pattern-not-inside: |
+          export function siteSlugFromPrefixSegment(...) { ... }
+      - pattern-not-inside: |
+          const STAGING_PREFIX_PATTERN = $PATTERN;

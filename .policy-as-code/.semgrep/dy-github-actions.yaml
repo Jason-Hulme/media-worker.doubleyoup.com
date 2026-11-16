@@ -1,0 +1,120 @@
+# hub#495 rule B8: GitHub Actions injection and untrusted-checkout rules.
+#
+# WHY THESE ARE NOT VENDORED. The issue asks for the Semgrep registry's GitHub Actions rules. Their
+# licence (Semgrep Rules License v1.0) allows internal use only and forbids distribution, and this
+# repository is public: a copy here would be a distribution. These three rules are this repo's own,
+# written for the same three bug classes, with their own good and bad fixtures (`<rule>.test.yaml`).
+#
+# They run in the blocking scan next to conftest's workflows.rego, which keeps its own allowlist rule for
+# `run:` scripts. The two overlap on purpose: semgrep reports the line, conftest the job.
+rules:
+  # A `run:` script is pasted into the shell AFTER the `${{ }}` expressions are expanded, so a PR title,
+  # a branch name or a comment body inside one is shell code. Pass the value through `env:` and quote it.
+  - id: dy-gha-run-shell-injection
+    message: >-
+      A `run:` script expands `${{ }}` data that a contributor can write (github.event.*, github.head_ref,
+      the whole github context). That text becomes shell code before the shell runs. Put the value in
+      `env:` and reference it as "$NAME" (hub#495 rule B8).
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      include:
+        - "/.github/"
+        - "*.test.yaml"
+    patterns:
+      - pattern-inside: |
+          steps: [...]
+      - pattern: |
+          run: $SCRIPT
+      - metavariable-pattern:
+          metavariable: $SCRIPT
+          language: generic
+          patterns:
+            - pattern-regex: (?s)\$\{\{[^}]*(github\s*\.\s*(event\b|head_ref\b)|github\s*\[|\(\s*github\s*\))
+
+  # actions/github-script evaluates `script:` as JavaScript after the same expansion: the same sink, in JS.
+  - id: dy-gha-github-script-injection
+    message: >-
+      An actions/github-script `script:` expands `${{ }}` data that a contributor can write. That text
+      becomes JavaScript before it runs. Put the value in `env:` and read it as process.env.NAME (hub#495
+      rule B8).
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      include:
+        - "/.github/"
+        - "*.test.yaml"
+    patterns:
+      - pattern-inside: |
+          steps: [...]
+      - pattern-inside: |
+          uses: $ACTION
+          ...
+      - metavariable-regex:
+          metavariable: $ACTION
+          regex: ^actions/github-script@
+      - pattern: |
+          script: $SCRIPT
+      - metavariable-pattern:
+          metavariable: $SCRIPT
+          language: generic
+          patterns:
+            - pattern-regex: (?s)\$\{\{[^}]*(github\s*\.\s*(event\b|head_ref\b)|github\s*\[|\(\s*github\s*\))
+
+  # pull_request_target and workflow_run run the BASE branch's workflow with the base repository's token
+  # and secrets. Checking out the PR's (or the triggering run's) code there is safe only when nothing from
+  # that code runs. The rule cannot see that, so every such checkout is a finding; a reviewed data-only
+  # checkout carries `# nosemgrep: dy-gha-target-code-checkout` with the reason.
+  - id: dy-gha-target-code-checkout
+    message: >-
+      A pull_request_target or workflow_run workflow checks out the pull request's code. That workflow runs
+      with the base repository's token and secrets, so any build script, npm script or shell script in the
+      checked-out code runs with them. Do not check it out; if the files are only read as data, say so in a
+      `# nosemgrep: dy-gha-target-code-checkout` comment with the reason (hub#495 rule B8).
+    severity: ERROR
+    languages: [yaml]
+    paths:
+      include:
+        - "/.github/"
+        - "*.test.yaml"
+    patterns:
+      - pattern-either:
+          - pattern-inside: |
+              on:
+                ...
+                pull_request_target: ...
+                ...
+              ...
+          - pattern-inside: |
+              on: [..., pull_request_target, ...]
+              ...
+          - pattern-inside: |
+              on: pull_request_target
+              ...
+          - pattern-inside: |
+              on:
+                ...
+                workflow_run: ...
+                ...
+              ...
+          - pattern-inside: |
+              on: [..., workflow_run, ...]
+              ...
+          - pattern-inside: |
+              on: workflow_run
+              ...
+      - pattern-inside: |
+          steps: [...]
+      - pattern-inside: |
+          uses: $ACTION
+          ...
+      - pattern: |
+          ref: $REF
+      - metavariable-regex:
+          metavariable: $ACTION
+          regex: ^actions/checkout@
+      - metavariable-pattern:
+          metavariable: $REF
+          language: generic
+          patterns:
+            - pattern-regex: (github\s*\.\s*(event\s*\.\s*(pull_request\s*\.\s*head|workflow_run)|head_ref)|refs/pull/)

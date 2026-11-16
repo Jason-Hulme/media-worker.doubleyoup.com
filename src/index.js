@@ -151,6 +151,29 @@ export function bucketAttemptOrder(slug, env) {
   return [perSiteBucket, sharedBucket];
 }
 
+// Soft delete on a MIGRATED site: the media relocation copies a site's objects into its
+// per-site bucket and leaves the shared-bucket copies where they are. Once that site
+// soft-deletes a file, its per-site bucket answers 404, and the fallback would serve the
+// old shared-bucket copy. So a migrated slug has no fallback at all: a per-site 404 is the
+// final answer, and a per-site 401/403 surfaces as a 500 (a broken read credential) instead
+// of being masked by the shared bucket.
+//
+// The signal is one key per slug in the HOSTMAP namespace: "migrated:<slug>" present means
+// migrated. A hostname never contains ":", so the key cannot collide with a hostname entry.
+// Absent key (every site today) = not migrated = the fallback stays as before.
+// Exported (like the bucket helpers) purely so it is unit-testable.
+export function migratedFlagKey(slug) {
+  return `migrated:${slug}`;
+}
+
+async function isSiteMigrated(slug, env) {
+  // The shared host never needed HOSTMAP; a deployment without the binding has no
+  // migrated sites to mark.
+  if (!env.HOSTMAP) return false;
+  const flag = await env.HOSTMAP.get(migratedFlagKey(slug));
+  return flag !== null && flag !== undefined;
+}
+
 // Only ever asked about the PRIMARY attempt's status — a fallback response is handed
 // to buildClientResponse as-is, so a 401/403 from the shared bucket stays a visible
 // 500 (broken credential) instead of quietly becoming a cached 404.
@@ -228,36 +251,102 @@ function contentTypeForKey(key) {
   return EXT_CONTENT_TYPES[ext] || "application/octet-stream";
 }
 
-// Media is public, static, cross-origin-embeddable content — permissive read
-// CORS on every response (including errors, so a broken <img>/<video> src
-// fails with a clean 404 rather than an opaque CORS error in the console).
-function baseHeaders() {
-  return new Headers({ "access-control-allow-origin": "*" });
+// Content types a browser renders as an active document that can run script: HTML, SVG and
+// every XML type (an XML document can carry XHTML or SVG namespaces). Every site on the shared
+// host shares ONE origin, so a tenant's .html/.svg opened from a media URL would run script
+// on the origin that serves every other tenant's media. Those are sent as a sandboxed download.
+const ACTIVE_DOCUMENT_CONTENT_TYPES = new Set([
+  "text/html",
+  "application/xhtml+xml",
+  "image/svg+xml",
+  "text/xml",
+  "application/xml",
+  "text/xsl",
+  "application/xslt+xml",
+]);
+
+// The bare media type of a content-type header: "Text/HTML; charset=utf-8" -> "text/html".
+function mediaTypeOf(contentType) {
+  const withoutParameters = contentType.split(";")[0];
+  return withoutParameters.trim().toLowerCase();
+}
+
+function isActiveDocumentContentType(contentType) {
+  if (!contentType) return false;
+  // A browser reads a comma-joined header ("image/png, text/html") by the Fetch "extract a MIME
+  // type" rule: it splits on commas and keeps the LAST valid type. So the first type cannot be
+  // trusted, and any content-type with a comma is treated as active.
+  if (contentType.includes(",")) return true;
+  const mediaType = mediaTypeOf(contentType);
+  if (ACTIVE_DOCUMENT_CONTENT_TYPES.has(mediaType)) return true;
+  // multipart/x-mixed-replace (and any other multipart type) can be rendered part by part,
+  // each part with its own content-type, so a part can be HTML.
+  if (mediaType.startsWith("multipart/")) return true;
+  // Any other XML-based type (application/rss+xml, application/atom+xml, ...).
+  return mediaType.endsWith("+xml");
+}
+
+// The list above is a blocklist and cannot name every type some browser renders as a page,
+// so content-security-policy: sandbox goes on EVERY response, not only on the active types.
+// It has no effect on <img>/<video>/<audio> embeds. The one exception is a plain PDF: Chrome
+// refuses to show a sandboxed PDF, and its PDF viewer runs in its own origin, not in the
+// media origin, so a PDF cannot run script here anyway.
+function needsSandbox(contentType) {
+  if (!contentType) return true;
+  if (contentType.includes(",")) return true;
+  const isPlainPdf = mediaTypeOf(contentType) === "application/pdf";
+  return !isPlainPdf;
+}
+
+// THE ONLY place a Response is built (policy rule dy-media-response-headers enforces it), so
+// every response — media, 304/412, 404/405/400/500 — gets the same safety headers:
+//   • access-control-allow-origin: * — media is public, cross-origin-embeddable content, and
+//     errors carry it too, so a broken <img>/<video> src fails with a clean 404 rather than an
+//     opaque CORS error in the console.
+//   • x-content-type-options: nosniff — a browser must not guess an active type from the
+//     bytes of an object stored as (or falling back to) a passive or unknown type.
+//   • content-security-policy: sandbox on every response except a plain PDF (see
+//     needsSandbox), so anything a browser renders as a page runs in an opaque origin with
+//     scripts off.
+//   • for an active document type (see above): also content-disposition: attachment, so
+//     opening it downloads it. <img src="x.svg"> embeds are unaffected: an image embed
+//     ignores both headers.
+// Exported (like the bucket helpers) purely so it is unit-testable.
+export function mediaResponse(body, { status, headers }) {
+  const responseHeaders = new Headers(headers);
+  responseHeaders.set("access-control-allow-origin", "*");
+  responseHeaders.set("x-content-type-options", "nosniff");
+
+  const contentType = responseHeaders.get("content-type");
+  if (needsSandbox(contentType)) {
+    responseHeaders.set("content-security-policy", "sandbox");
+  }
+  if (isActiveDocumentContentType(contentType)) {
+    responseHeaders.set("content-disposition", "attachment");
+    responseHeaders.set("content-security-policy", "sandbox");
+  }
+
+  return new Response(body, { status, headers: responseHeaders });
 }
 
 function notFound(method) {
-  const headers = baseHeaders();
-  headers.set("cache-control", NOT_FOUND_CACHE);
-  return new Response(method === "HEAD" ? null : "Not found", { status: 404, headers });
+  const headers = new Headers({ "cache-control": NOT_FOUND_CACHE });
+  return mediaResponse(method === "HEAD" ? null : "Not found", { status: 404, headers });
 }
 
 function methodNotAllowed() {
-  const headers = baseHeaders();
-  headers.set("allow", ALLOWED_METHODS);
-  return new Response("Method Not Allowed", { status: 405, headers });
+  const headers = new Headers({ allow: ALLOWED_METHODS });
+  return mediaResponse("Method Not Allowed", { status: 405, headers });
 }
 
 function badRequest(method) {
-  return new Response(method === "HEAD" ? null : "Bad request", { status: 400, headers: baseHeaders() });
+  return mediaResponse(method === "HEAD" ? null : "Bad request", { status: 400, headers: new Headers() });
 }
 
 // Never leak internals (stack traces, R2/S3 error detail, signing state) to the
 // client — always a bare 500 with CORS so a broken embed still fails cleanly.
 function internalError() {
-  return new Response("Internal error", {
-    status: 500,
-    headers: { "access-control-allow-origin": "*" },
-  });
+  return mediaResponse("Internal error", { status: 500, headers: new Headers() });
 }
 
 // ── SigV4 helpers ─────────────────────────────────────────────────────────────
@@ -410,7 +499,7 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
     return internalError();
   }
 
-  const headers = baseHeaders();
+  const headers = new Headers();
   const upstreamContentType = upstream.headers.get("content-type");
   headers.set("content-type", upstreamContentType || contentTypeForKey(key));
   const upstreamEtag = upstream.headers.get("etag");
@@ -427,7 +516,7 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
   // heuristic, so an If-Modified-Since-only not-modified case is now correctly a
   // 304 (previously a 412). Every other conditional outcome is unchanged.
   if (status === 304 || status === 412) {
-    return new Response(null, { status, headers });
+    return mediaResponse(null, { status, headers });
   }
 
   if (status === 206) {
@@ -435,13 +524,13 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
     if (contentRange) headers.set("content-range", contentRange);
     const contentLength = upstream.headers.get("content-length");
     if (contentLength) headers.set("content-length", contentLength);
-    return new Response(method === "HEAD" ? null : upstream.body, { status: 206, headers });
+    return mediaResponse(method === "HEAD" ? null : upstream.body, { status: 206, headers });
   }
 
   // 200 — full object.
   const contentLength = upstream.headers.get("content-length");
   if (contentLength) headers.set("content-length", contentLength);
-  return new Response(method === "HEAD" ? null : upstream.body, { status: 200, headers });
+  return mediaResponse(method === "HEAD" ? null : upstream.body, { status: 200, headers });
 }
 
 // Read one key: the per-site bucket first, the shared (legacy) bucket only as a fallback.
@@ -466,10 +555,9 @@ async function readKeyFromSiteBuckets({ method, env, slug, key, clientHeaders, l
   // COST: for a site that has NOT been migrated yet this is one extra upstream
   // round-trip per request that reaches the Worker (the primary 404s/403s first).
   // Accepted: it is a same-datacentre R2 request and repeat hits are absorbed by the
-  // long immutable Cache-Control on the eventual 200. A per-slug "migrated" flag in
-  // KV would remove the wasted attempt — deliberately NOT built yet (it adds a KV
-  // read on every request plus a write path to keep the flag in sync, so it is only
-  // worth it if the extra round-trip actually shows up in latency).
+  // long immutable Cache-Control on the eventual 200. The "migrated:<slug>" KV flag
+  // below is read ONLY on such a primary miss, never on a primary 200, so a migrated
+  // site's normal traffic pays no KV read.
   //
   // The response cache is keyed on the PUBLIC url (media host + <slug>/<path>), never
   // on which bucket answered — the same key holds byte-identical objects in both
@@ -479,6 +567,10 @@ async function readKeyFromSiteBuckets({ method, env, slug, key, clientHeaders, l
   // up to NOT_FOUND_CACHE.
   if (fallbackBucket !== undefined && shouldFallbackToSharedBucket(upstream.status)) {
     const primaryStatus = upstream.status;
+
+    // A migrated site's per-site bucket is the only truth: its 404 may be a soft delete,
+    // whose old copy still sits in the shared bucket (see isSiteMigrated).
+    if (await isSiteMigrated(slug, env)) return upstream;
 
     // OBSERVABILITY (the fallback's one real hazard): a fallback 404 is served
     // through the status===404 branch of buildClientResponse, so without this line a

@@ -273,6 +273,10 @@ function mediaTypeOf(contentType) {
 
 function isActiveDocumentContentType(contentType) {
   if (!contentType) return false;
+  // A browser reads a comma-joined header ("image/png, text/html") by the Fetch "extract a MIME
+  // type" rule: it splits on commas and keeps the LAST valid type. So the first type cannot be
+  // trusted, and any content-type with a comma is treated as active.
+  if (contentType.includes(",")) return true;
   const mediaType = mediaTypeOf(contentType);
   if (ACTIVE_DOCUMENT_CONTENT_TYPES.has(mediaType)) return true;
   // Any other XML-based type (application/rss+xml, application/atom+xml, ...).

@@ -75,11 +75,13 @@ check_bad_workflow_fixtures_fail() {
         ;;
     esac
   done
-  # shellcheck disable=SC2086
-  if conftest test --no-color --policy "$POLICY_DIR" $fixture_targets > /dev/null; then
-    echo "FAIL: the bad workflow fixtures passed the workflow policy; they must be denied." >&2
-    return 1
-  fi
+  # Each fixture is checked alone: one run over all of them would pass when only one is denied.
+  for fixture_target in $fixture_targets; do
+    if conftest test --no-color --policy "$POLICY_DIR" "$fixture_target" > /dev/null; then
+      echo "FAIL: $fixture_target passed the workflow policy; it must be denied." >&2
+      fixture_status=1
+    fi
+  done
   if [ "$fixture_status" -ne 0 ]; then
     return 1
   fi

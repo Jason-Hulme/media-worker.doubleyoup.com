@@ -111,6 +111,9 @@ const activeContentTypes = [
   "application/xml",
   "application/rss+xml",
   "text/xsl",
+  // Comma-joined: a browser takes the last type, so this renders as HTML.
+  "image/png, text/html",
+  "image/png,text/html; charset=utf-8",
 ];
 
 for (const contentType of activeContentTypes) {
@@ -140,6 +143,14 @@ test("200 image: nosniff, inline", async () => {
 test("200 HTML stored by a tenant: sandboxed download", async () => {
   stubUpstream([objectResponse(200, { "content-type": "text/html" })]);
   const response = await worker.fetch(new Request(`https://media.doubleyoup.com/${SLUG}/page.html`), ENV);
+  assert.equal(response.status, 200);
+  assertBaseSafetyHeaders(response);
+  assertSandboxedDownload(response);
+});
+
+test("200 comma-joined content-type ending in HTML: sandboxed download", async () => {
+  stubUpstream([objectResponse(200, { "content-type": "image/png, text/html" })]);
+  const response = await worker.fetch(new Request(`https://media.doubleyoup.com/${SLUG}/x.png`), ENV);
   assert.equal(response.status, 200);
   assertBaseSafetyHeaders(response);
   assertSandboxedDownload(response);

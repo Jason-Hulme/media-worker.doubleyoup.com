@@ -29,7 +29,11 @@ applies the semantics itself and returns the status this Worker maps back. A lon
 immutable `Cache-Control` is set on
 hits, a short one on 404s (so a bad/unknown path or host doesn't hammer
 KV/R2 on every repeat request), and every response — including errors —
-carries permissive read CORS since this only ever serves public assets.
+carries permissive read CORS since this only ever serves public assets, and
+`X-Content-Type-Options: nosniff`. Every response except a plain PDF also carries
+`Content-Security-Policy: sandbox` (an `<img>`/`<video>`/`<audio>` embed ignores it).
+HTML, SVG, XML and multipart objects, and any comma-joined content-type, are also sent
+with `Content-Disposition: attachment` (`mediaResponse` in `src/index.js`).
 
 ## Soft delete (hub#222)
 
@@ -64,11 +68,12 @@ two buckets, in this order:
   the 60s negative cache), and 401/403 there is a 500, so a genuinely broken credential
   stays visible instead of turning into cached "not found".
 - Cost: an unmigrated site pays one extra R2 round-trip per request that reaches the
-  Worker. A per-slug "migrated" flag in KV would remove it — deliberately not built.
-- Migration caveat: while a site's old objects still exist in the shared bucket, they
-  stay publicly readable through the fallback. Deleting an object from the per-site
-  bucket does **not** stop it being served until the shared-bucket copy is deleted too,
-  so the copy-then-delete migration has to finish the delete.
+  Worker.
+- Migrated sites: a `migrated:<slug>` key in the `HOSTMAP` namespace (any value) turns
+  the fallback off for that slug. A per-site 404 is then final and a per-site 401/403 is
+  a 500, so an object deleted from the per-site bucket is not served from its old
+  shared-bucket copy. The key is read only when the primary answered 404/401/403. Without
+  the key, the shared-bucket copy of a deleted object stays publicly readable.
 - The response cache is keyed on the public URL (`<host>/<slug>/<path>`), never on
   which bucket answered, and the two buckets hold byte-identical objects under the same
   key — so a site migrating mid-cache is safe; the only staleness is a negative 404

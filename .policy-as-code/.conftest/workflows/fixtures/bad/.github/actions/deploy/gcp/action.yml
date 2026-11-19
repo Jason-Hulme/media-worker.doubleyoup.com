@@ -1,0 +1,8 @@
+# BAD fixture (hub#495 rule gap A2). A composite action two folders deep under .github/actions.
+# scripts/conftest.sh once collected only .github/actions/*/action.y*ml, one level deep, so this
+# tag-pinned step was never checked although a job with id-token: write can call it.
+name: gcp
+runs:
+  using: composite
+  steps:
+    - uses: google-github-actions/auth@v2

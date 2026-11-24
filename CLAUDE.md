@@ -69,8 +69,8 @@ This is effectively a one-file Worker:
   (primary 404 + fallback 404). Keep both silent on primary-200 and on
   primary-404 → fallback-200, which is every request from an unmigrated site.
   A third line, `stored-content-encoding-mismatch`, fires when an object with a stored
-  `Content-Encoding` fails to decode or decodes to 0 bytes (hub#585); that request gets
-  a 500, never an empty 200 with the immutable cache.
+  `Content-Encoding` fails to decode, decodes to 0 bytes, or decodes past the 8 MiB cap
+  (`reason=decode-failed|empty-body|too-large`, hub#585); that request gets a 500, never an empty 200 with the immutable cache.
 
 - **R2 key scheme is always `<slug>/<path>`, never anything else.** Shared-host
   requests already have the slug as the path's first segment (key = raw path);

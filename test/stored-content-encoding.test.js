@@ -116,6 +116,30 @@ test("GET of a genuinely empty encoded object (content-length 0) stays a 200", a
   assert.deepEqual(mismatchWarnings(), []);
 });
 
+test("GET of an encoded object that decodes past the size cap: logged 500, stream cancelled", async () => {
+  let cancelled = false;
+  let chunksPulled = 0;
+  const oneMebibyteChunk = new Uint8Array(1024 * 1024);
+  // An endless stream, like a gzip bomb: only the cap can stop the read.
+  const bombStream = new ReadableStream({
+    pull(controller) {
+      chunksPulled += 1;
+      controller.enqueue(oneMebibyteChunk);
+    },
+    cancel() {
+      cancelled = true;
+    },
+  });
+  stubUpstream(encodedObjectResponse({ body: bombStream, contentLength: "1000" }));
+
+  const response = await worker.fetch(new Request(CSS_URL), ENV);
+
+  assertUncachedMismatch500(response);
+  assert.match(mismatchWarnings()[0], /reason=too-large/);
+  assert.equal(cancelled, true);
+  assert.ok(chunksPulled < 20, `read stopped near the cap, pulled ${chunksPulled} chunks`);
+});
+
 test("206 range of an encoded object whose decode fails: logged 500", async () => {
   stubUpstream(
     encodedObjectResponse({

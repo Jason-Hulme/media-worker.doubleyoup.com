@@ -70,6 +70,11 @@ const NOT_FOUND_CACHE = "public, max-age=60"; // small + cacheable, so a bad/unk
 // start serving it, so a long-lived cached copy of the live bytes would hide it.
 const LIVE_KEY_FALLBACK_CACHE = "public, max-age=300";
 const ALLOWED_METHODS = "GET, HEAD";
+// hub#585: the most decoded bytes we buffer for an object with a stored Content-Encoding. Such
+// objects are css/svg/ttf in practice, far below this. The cap bounds isolate memory, because
+// the object's Content-Encoding is tenant-controlled metadata: a huge object or a gzip bomb
+// must not push the isolate past its memory limit and cancel other sites' in-flight requests.
+const MAX_DECODED_BODY_BYTES = 8 * 1024 * 1024;
 const EXPOSED_HEADERS = "content-length, content-range, etag, accept-ranges";
 
 // A slug becomes part of an R2 bucket name ("doubleyoup-media-<slug>") that this
@@ -559,16 +564,16 @@ async function buildDecodedBodyResponse(upstream, status, headers, key) {
   const contentEncoding = upstream.headers.get("content-encoding");
   const upstreamContentLength = Number(upstream.headers.get("content-length") || "0");
 
-  let decodedBody;
-  try {
-    decodedBody = await upstream.arrayBuffer();
-  } catch (err) {
+  const readResult = await readDecodedBodyWithinCap(upstream);
+  if (readResult.failureReason) {
     console.warn(
       `[media-worker] stored-content-encoding-mismatch key=${key} ` +
-        `content_encoding=${contentEncoding} upstream_length=${upstreamContentLength} reason=decode-failed`,
+        `content_encoding=${contentEncoding} upstream_length=${upstreamContentLength} ` +
+        `reason=${readResult.failureReason}`,
     );
     return internalError();
   }
+  const decodedBody = readResult.bytes;
 
   const decodedIsEmpty = decodedBody.byteLength === 0;
   const upstreamPromisedBytes = upstreamContentLength > 0;
@@ -588,6 +593,43 @@ async function buildDecodedBodyResponse(upstream, status, headers, key) {
     if (contentRange) headers.set("content-range", contentRange);
   }
   return mediaResponse(decodedBody, { status, headers });
+}
+
+// Reads the decoded body chunk by chunk and stops at MAX_DECODED_BODY_BYTES. Returns
+// { bytes } on success, or { failureReason } with "decode-failed" (the stream threw) or
+// "too-large" (over the cap; the stream is cancelled so the rest is never decoded or buffered).
+async function readDecodedBodyWithinCap(upstream) {
+  if (!upstream.body) {
+    return { bytes: new Uint8Array(0) };
+  }
+
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  while (true) {
+    let chunkResult;
+    try {
+      chunkResult = await reader.read();
+    } catch (err) {
+      return { failureReason: "decode-failed" };
+    }
+    if (chunkResult.done) break;
+
+    totalBytes += chunkResult.value.byteLength;
+    if (totalBytes > MAX_DECODED_BODY_BYTES) {
+      await reader.cancel().catch(() => {});
+      return { failureReason: "too-large" };
+    }
+    chunks.push(chunkResult.value);
+  }
+
+  const bytes = new Uint8Array(totalBytes);
+  let writeOffset = 0;
+  for (const chunk of chunks) {
+    bytes.set(chunk, writeOffset);
+    writeOffset += chunk.byteLength;
+  }
+  return { bytes };
 }
 
 // Read one key: the per-site bucket first, the shared (legacy) bucket only as a fallback.

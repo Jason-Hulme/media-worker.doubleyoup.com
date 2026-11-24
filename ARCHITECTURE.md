@@ -126,7 +126,10 @@ Step numbers match the diagram and the order in `fetch()` in `src/index.js`.
    yields 0 bytes while R2 sent a non-zero `content-length`, the object stores a
    header that does not match its bytes (the hub#43 relocation copy did this to
    svg/css/ttf). The Worker then logs `stored-content-encoding-mismatch` and returns
-   the bare 500, not an empty 200 with the immutable cache. On success it sends the
+   the bare 500, not an empty 200 with the immutable cache. The read is capped at
+   8 MiB (`MAX_DECODED_BODY_BYTES`): a larger decoded body is cancelled and refused the
+   same way (`reason=too-large`), because the stored encoding is tenant-controlled and
+   an unbounded read could exhaust the isolate. On success it sends the
    decoded bytes with their own `content-length` and no `content-encoding`. HEAD is
    unchanged. Repair such objects with orchestrator's `npm run media-relocate --
    --repair-encoding`.

@@ -70,6 +70,20 @@ const NOT_FOUND_CACHE = "public, max-age=60"; // small + cacheable, so a bad/unk
 // start serving it, so a long-lived cached copy of the live bytes would hide it.
 const LIVE_KEY_FALLBACK_CACHE = "public, max-age=300";
 const ALLOWED_METHODS = "GET, HEAD";
+// hub#585: the most decoded bytes we buffer for an object with a stored Content-Encoding. Such
+// objects are css/svg/ttf in practice, far below this. The cap bounds isolate memory, because
+// the object's Content-Encoding is tenant-controlled metadata: a huge object or a gzip bomb
+// must not push the isolate past its memory limit and cancel other sites' in-flight requests.
+const MAX_DECODED_BODY_BYTES = 8 * 1024 * 1024;
+// hub#585 review: the per-request cap does not bound the isolate, because one isolate serves
+// many requests at once and a tenant can fire them in parallel. This is the most bytes all
+// concurrent decoded-body reads in ONE isolate may hold together. A read that would pass it
+// is refused (reason=busy) instead of risking the isolate's memory limit. Per isolate, so it
+// needs no lock and no shared state between isolates.
+const MAX_BUFFERED_BYTES_PER_ISOLATE = 32 * 1024 * 1024;
+// Bytes currently reserved by in-flight decoded-body reads in this isolate. Safe without a
+// lock: JavaScript in an isolate is single-threaded and reserve/release never await.
+let bufferedBytesInFlight = 0;
 const EXPOSED_HEADERS = "content-length, content-range, etag, accept-ranges";
 
 // A slug becomes part of an R2 bucket name ("doubleyoup-media-<slug>") that this
@@ -519,6 +533,10 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
     return mediaResponse(null, { status, headers });
   }
 
+  if (method === "GET" && hasStoredContentEncoding(upstream)) {
+    return buildDecodedBodyResponse(upstream, status, headers, key);
+  }
+
   if (status === 206) {
     const contentRange = upstream.headers.get("content-range");
     if (contentRange) headers.set("content-range", contentRange);
@@ -531,6 +549,116 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
   const contentLength = upstream.headers.get("content-length");
   if (contentLength) headers.set("content-length", contentLength);
   return mediaResponse(method === "HEAD" ? null : upstream.body, { status: 200, headers });
+}
+
+// True when the R2 object carries a stored Content-Encoding (other than identity). The
+// Workers runtime then decodes the body inside fetch(), so the bytes we stream are NOT the
+// stored bytes and the upstream content-length no longer describes them.
+function hasStoredContentEncoding(upstream) {
+  const contentEncoding = upstream.headers.get("content-encoding");
+  if (!contentEncoding) return false;
+  if (contentEncoding.trim().toLowerCase() === "identity") return false;
+  return true;
+}
+
+// hub#585: an object can store "Content-Encoding: gzip" over plain bytes (the hub#43
+// relocation copy did this to svg/css/ttf). The runtime's gunzip of such a body fails, and a
+// streamed response then reaches the client as a 200 with a 0-byte body and the 1-year
+// immutable cache-control, so browsers keep the broken file. So for an encoded object we read
+// the whole decoded body first. A read that throws, or that yields 0 bytes while R2 promised
+// bytes, is a stored-encoding mismatch: log it and return the uncached 500 instead of a fake
+// success. Only objects with a stored Content-Encoding take this path (text types in practice,
+// which are small), so normal media still streams.
+async function buildDecodedBodyResponse(upstream, status, headers, key) {
+  const contentEncoding = upstream.headers.get("content-encoding");
+  const upstreamContentLength = Number(upstream.headers.get("content-length") || "0");
+
+  const readResult = await readDecodedBodyWithinCap(upstream);
+  if (readResult.failureReason) {
+    console.warn(
+      `[media-worker] stored-content-encoding-mismatch key=${key} ` +
+        `content_encoding=${contentEncoding} upstream_length=${upstreamContentLength} ` +
+        `reason=${readResult.failureReason}`,
+    );
+    return internalError();
+  }
+  const decodedBody = readResult.bytes;
+
+  const decodedIsEmpty = decodedBody.byteLength === 0;
+  const upstreamPromisedBytes = upstreamContentLength > 0;
+  if (decodedIsEmpty && upstreamPromisedBytes) {
+    console.warn(
+      `[media-worker] stored-content-encoding-mismatch key=${key} ` +
+        `content_encoding=${contentEncoding} upstream_length=${upstreamContentLength} reason=empty-body`,
+    );
+    return internalError();
+  }
+
+  // The upstream content-length counts the STORED (encoded) bytes. We send the decoded bytes
+  // without a content-encoding header, so the length must be the decoded length.
+  headers.set("content-length", String(decodedBody.byteLength));
+  if (status === 206) {
+    const contentRange = upstream.headers.get("content-range");
+    if (contentRange) headers.set("content-range", contentRange);
+  }
+  return mediaResponse(decodedBody, { status, headers });
+}
+
+// Reads the decoded body chunk by chunk and stops at MAX_DECODED_BODY_BYTES. Returns
+// { bytes } on success, or { failureReason } with "decode-failed" (the stream threw),
+// "too-large" (over the per-request cap) or "busy" (the isolate-wide buffer budget is used
+// up by other reads). On too-large and busy the stream is cancelled so the rest is never
+// decoded or buffered.
+//
+// Each chunk reserves TWICE its size from the isolate budget: the chunks stay in memory while
+// the final contiguous copy is built, so the peak is about twice the body size. The
+// reservation is released when this function returns (the budget bounds the read, which is
+// where the decoding and the gzip-bomb growth happen).
+async function readDecodedBodyWithinCap(upstream) {
+  if (!upstream.body) {
+    return { bytes: new Uint8Array(0) };
+  }
+
+  const reader = upstream.body.getReader();
+  const chunks = [];
+  let totalBytes = 0;
+  let reservedBytes = 0;
+  try {
+    while (true) {
+      let chunkResult;
+      try {
+        chunkResult = await reader.read();
+      } catch (err) {
+        return { failureReason: "decode-failed" };
+      }
+      if (chunkResult.done) break;
+
+      totalBytes += chunkResult.value.byteLength;
+      if (totalBytes > MAX_DECODED_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        return { failureReason: "too-large" };
+      }
+
+      const bytesToReserve = chunkResult.value.byteLength * 2;
+      if (bufferedBytesInFlight + bytesToReserve > MAX_BUFFERED_BYTES_PER_ISOLATE) {
+        await reader.cancel().catch(() => {});
+        return { failureReason: "busy" };
+      }
+      bufferedBytesInFlight += bytesToReserve;
+      reservedBytes += bytesToReserve;
+      chunks.push(chunkResult.value);
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let writeOffset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, writeOffset);
+      writeOffset += chunk.byteLength;
+    }
+    return { bytes };
+  } finally {
+    bufferedBytesInFlight -= reservedBytes;
+  }
 }
 
 // Read one key: the per-site bucket first, the shared (legacy) bucket only as a fallback.
@@ -711,10 +839,12 @@ export default {
         }
 
         // Served from the live key: short cache (see LIVE_KEY_FALLBACK_CACHE).
-        return buildClientResponse(upstream, method, liveKey, LIVE_KEY_FALLBACK_CACHE);
+        // await: buildClientResponse can return a promise (encoded objects), and a rejection
+        // must land in the catch below, not escape fetch().
+        return await buildClientResponse(upstream, method, liveKey, LIVE_KEY_FALLBACK_CACHE);
       }
 
-      return buildClientResponse(upstream, method, key);
+      return await buildClientResponse(upstream, method, key);
     } catch (err) {
       // Never throw out of fetch() and never leak internals to the client.
       return internalError();

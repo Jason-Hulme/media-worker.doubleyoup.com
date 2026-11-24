@@ -768,10 +768,12 @@ export default {
         }
 
         // Served from the live key: short cache (see LIVE_KEY_FALLBACK_CACHE).
-        return buildClientResponse(upstream, method, liveKey, LIVE_KEY_FALLBACK_CACHE);
+        // await: buildClientResponse can return a promise (encoded objects), and a rejection
+        // must land in the catch below, not escape fetch().
+        return await buildClientResponse(upstream, method, liveKey, LIVE_KEY_FALLBACK_CACHE);
       }
 
-      return buildClientResponse(upstream, method, key);
+      return await buildClientResponse(upstream, method, key);
     } catch (err) {
       // Never throw out of fetch() and never leak internals to the client.
       return internalError();

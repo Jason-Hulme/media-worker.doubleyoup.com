@@ -519,6 +519,10 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
     return mediaResponse(null, { status, headers });
   }
 
+  if (method === "GET" && hasStoredContentEncoding(upstream)) {
+    return buildDecodedBodyResponse(upstream, status, headers, key);
+  }
+
   if (status === 206) {
     const contentRange = upstream.headers.get("content-range");
     if (contentRange) headers.set("content-range", contentRange);
@@ -531,6 +535,59 @@ function buildClientResponse(upstream, method, key, cacheControlOverride) {
   const contentLength = upstream.headers.get("content-length");
   if (contentLength) headers.set("content-length", contentLength);
   return mediaResponse(method === "HEAD" ? null : upstream.body, { status: 200, headers });
+}
+
+// True when the R2 object carries a stored Content-Encoding (other than identity). The
+// Workers runtime then decodes the body inside fetch(), so the bytes we stream are NOT the
+// stored bytes and the upstream content-length no longer describes them.
+function hasStoredContentEncoding(upstream) {
+  const contentEncoding = upstream.headers.get("content-encoding");
+  if (!contentEncoding) return false;
+  if (contentEncoding.trim().toLowerCase() === "identity") return false;
+  return true;
+}
+
+// hub#585: an object can store "Content-Encoding: gzip" over plain bytes (the hub#43
+// relocation copy did this to svg/css/ttf). The runtime's gunzip of such a body fails, and a
+// streamed response then reaches the client as a 200 with a 0-byte body and the 1-year
+// immutable cache-control, so browsers keep the broken file. So for an encoded object we read
+// the whole decoded body first. A read that throws, or that yields 0 bytes while R2 promised
+// bytes, is a stored-encoding mismatch: log it and return the uncached 500 instead of a fake
+// success. Only objects with a stored Content-Encoding take this path (text types in practice,
+// which are small), so normal media still streams.
+async function buildDecodedBodyResponse(upstream, status, headers, key) {
+  const contentEncoding = upstream.headers.get("content-encoding");
+  const upstreamContentLength = Number(upstream.headers.get("content-length") || "0");
+
+  let decodedBody;
+  try {
+    decodedBody = await upstream.arrayBuffer();
+  } catch (err) {
+    console.warn(
+      `[media-worker] stored-content-encoding-mismatch key=${key} ` +
+        `content_encoding=${contentEncoding} upstream_length=${upstreamContentLength} reason=decode-failed`,
+    );
+    return internalError();
+  }
+
+  const decodedIsEmpty = decodedBody.byteLength === 0;
+  const upstreamPromisedBytes = upstreamContentLength > 0;
+  if (decodedIsEmpty && upstreamPromisedBytes) {
+    console.warn(
+      `[media-worker] stored-content-encoding-mismatch key=${key} ` +
+        `content_encoding=${contentEncoding} upstream_length=${upstreamContentLength} reason=empty-body`,
+    );
+    return internalError();
+  }
+
+  // The upstream content-length counts the STORED (encoded) bytes. We send the decoded bytes
+  // without a content-encoding header, so the length must be the decoded length.
+  headers.set("content-length", String(decodedBody.byteLength));
+  if (status === 206) {
+    const contentRange = upstream.headers.get("content-range");
+    if (contentRange) headers.set("content-range", contentRange);
+  }
+  return mediaResponse(decodedBody, { status, headers });
 }
 
 // Read one key: the per-site bucket first, the shared (legacy) bucket only as a fallback.

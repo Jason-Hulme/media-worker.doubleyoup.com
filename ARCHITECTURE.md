@@ -120,6 +120,17 @@ Step numbers match the diagram and the order in `fetch()` in `src/index.js`.
    `access-control-expose-headers`, and a `cache-control` (upstream's, else `public,
    max-age=31536000, immutable`).
 
+   A GET whose upstream 200/206 carries a stored `Content-Encoding` (not `identity`)
+   is not streamed (hub#585). The Workers runtime decodes such a body inside
+   `fetch()`, so the Worker reads the decoded body first. If the read fails, or it
+   yields 0 bytes while R2 sent a non-zero `content-length`, the object stores a
+   header that does not match its bytes (the hub#43 relocation copy did this to
+   svg/css/ttf). The Worker then logs `stored-content-encoding-mismatch` and returns
+   the bare 500, not an empty 200 with the immutable cache. On success it sends the
+   decoded bytes with their own `content-length` and no `content-encoding`. HEAD is
+   unchanged. Repair such objects with orchestrator's `npm run media-relocate --
+   --repair-encoding`.
+
 Every path is wrapped in a top-level try/catch that returns a bare 500 —
 `fetch()` never throws and never leaks internals to the client.
 

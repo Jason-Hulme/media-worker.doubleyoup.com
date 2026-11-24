@@ -140,6 +140,57 @@ test("GET of an encoded object that decodes past the size cap: logged 500, strea
   assert.ok(chunksPulled < 20, `read stopped near the cap, pulled ${chunksPulled} chunks`);
 });
 
+test("concurrent encoded reads past the isolate buffer budget: extra requests get a logged 500 (busy)", async () => {
+  const oneMebibyteChunk = new Uint8Array(1024 * 1024);
+  const chunksPerObject = 6; // 6 MiB decoded, 12 MiB reserved: three of these pass 32 MiB
+  const concurrentRequests = 4;
+
+  // Each stream sends its chunks, then waits for the gate, so all reads are in flight together.
+  let openGate;
+  const gate = new Promise((resolve) => {
+    openGate = resolve;
+  });
+  function slowObjectStream() {
+    let chunksSent = 0;
+    return new ReadableStream({
+      async pull(controller) {
+        if (chunksSent < chunksPerObject) {
+          chunksSent += 1;
+          controller.enqueue(oneMebibyteChunk);
+          return;
+        }
+        await gate;
+        controller.close();
+      },
+    });
+  }
+  globalThis.fetch = async () =>
+    encodedObjectResponse({ body: slowObjectStream(), contentLength: "1000" });
+  setTimeout(openGate, 50);
+
+  const responses = await Promise.all(
+    Array.from({ length: concurrentRequests }, () => worker.fetch(new Request(CSS_URL), ENV)),
+  );
+
+  const busyResponses = responses.filter((response) => response.status === 500);
+  const servedResponses = responses.filter((response) => response.status === 200);
+  assert.ok(busyResponses.length >= 1, "at least one read was refused");
+  assert.ok(servedResponses.length >= 1, "reads inside the budget still succeed");
+  assert.equal(mismatchWarnings().length, busyResponses.length);
+  for (const line of mismatchWarnings()) {
+    assert.match(line, /reason=busy/);
+  }
+
+  // The reservations were released: a single read of the same size succeeds again.
+  warnings = [];
+  openGate();
+  globalThis.fetch = async () =>
+    encodedObjectResponse({ body: slowObjectStream(), contentLength: "1000" });
+  const afterwards = await worker.fetch(new Request(CSS_URL), ENV);
+  assert.equal(afterwards.status, 200);
+  assert.deepEqual(mismatchWarnings(), []);
+});
+
 test("206 range of an encoded object whose decode fails: logged 500", async () => {
   stubUpstream(
     encodedObjectResponse({

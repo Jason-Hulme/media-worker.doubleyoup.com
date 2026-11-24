@@ -75,6 +75,15 @@ const ALLOWED_METHODS = "GET, HEAD";
 // the object's Content-Encoding is tenant-controlled metadata: a huge object or a gzip bomb
 // must not push the isolate past its memory limit and cancel other sites' in-flight requests.
 const MAX_DECODED_BODY_BYTES = 8 * 1024 * 1024;
+// hub#585 review: the per-request cap does not bound the isolate, because one isolate serves
+// many requests at once and a tenant can fire them in parallel. This is the most bytes all
+// concurrent decoded-body reads in ONE isolate may hold together. A read that would pass it
+// is refused (reason=busy) instead of risking the isolate's memory limit. Per isolate, so it
+// needs no lock and no shared state between isolates.
+const MAX_BUFFERED_BYTES_PER_ISOLATE = 32 * 1024 * 1024;
+// Bytes currently reserved by in-flight decoded-body reads in this isolate. Safe without a
+// lock: JavaScript in an isolate is single-threaded and reserve/release never await.
+let bufferedBytesInFlight = 0;
 const EXPOSED_HEADERS = "content-length, content-range, etag, accept-ranges";
 
 // A slug becomes part of an R2 bucket name ("doubleyoup-media-<slug>") that this
@@ -596,8 +605,15 @@ async function buildDecodedBodyResponse(upstream, status, headers, key) {
 }
 
 // Reads the decoded body chunk by chunk and stops at MAX_DECODED_BODY_BYTES. Returns
-// { bytes } on success, or { failureReason } with "decode-failed" (the stream threw) or
-// "too-large" (over the cap; the stream is cancelled so the rest is never decoded or buffered).
+// { bytes } on success, or { failureReason } with "decode-failed" (the stream threw),
+// "too-large" (over the per-request cap) or "busy" (the isolate-wide buffer budget is used
+// up by other reads). On too-large and busy the stream is cancelled so the rest is never
+// decoded or buffered.
+//
+// Each chunk reserves TWICE its size from the isolate budget: the chunks stay in memory while
+// the final contiguous copy is built, so the peak is about twice the body size. The
+// reservation is released when this function returns (the budget bounds the read, which is
+// where the decoding and the gzip-bomb growth happen).
 async function readDecodedBodyWithinCap(upstream) {
   if (!upstream.body) {
     return { bytes: new Uint8Array(0) };
@@ -606,30 +622,43 @@ async function readDecodedBodyWithinCap(upstream) {
   const reader = upstream.body.getReader();
   const chunks = [];
   let totalBytes = 0;
-  while (true) {
-    let chunkResult;
-    try {
-      chunkResult = await reader.read();
-    } catch (err) {
-      return { failureReason: "decode-failed" };
-    }
-    if (chunkResult.done) break;
+  let reservedBytes = 0;
+  try {
+    while (true) {
+      let chunkResult;
+      try {
+        chunkResult = await reader.read();
+      } catch (err) {
+        return { failureReason: "decode-failed" };
+      }
+      if (chunkResult.done) break;
 
-    totalBytes += chunkResult.value.byteLength;
-    if (totalBytes > MAX_DECODED_BODY_BYTES) {
-      await reader.cancel().catch(() => {});
-      return { failureReason: "too-large" };
-    }
-    chunks.push(chunkResult.value);
-  }
+      totalBytes += chunkResult.value.byteLength;
+      if (totalBytes > MAX_DECODED_BODY_BYTES) {
+        await reader.cancel().catch(() => {});
+        return { failureReason: "too-large" };
+      }
 
-  const bytes = new Uint8Array(totalBytes);
-  let writeOffset = 0;
-  for (const chunk of chunks) {
-    bytes.set(chunk, writeOffset);
-    writeOffset += chunk.byteLength;
+      const bytesToReserve = chunkResult.value.byteLength * 2;
+      if (bufferedBytesInFlight + bytesToReserve > MAX_BUFFERED_BYTES_PER_ISOLATE) {
+        await reader.cancel().catch(() => {});
+        return { failureReason: "busy" };
+      }
+      bufferedBytesInFlight += bytesToReserve;
+      reservedBytes += bytesToReserve;
+      chunks.push(chunkResult.value);
+    }
+
+    const bytes = new Uint8Array(totalBytes);
+    let writeOffset = 0;
+    for (const chunk of chunks) {
+      bytes.set(chunk, writeOffset);
+      writeOffset += chunk.byteLength;
+    }
+    return { bytes };
+  } finally {
+    bufferedBytesInFlight -= reservedBytes;
   }
-  return { bytes };
 }
 
 // Read one key: the per-site bucket first, the shared (legacy) bucket only as a fallback.

@@ -120,6 +120,23 @@ Step numbers match the diagram and the order in `fetch()` in `src/index.js`.
    `access-control-expose-headers`, and a `cache-control` (upstream's, else `public,
    max-age=31536000, immutable`).
 
+   A GET whose upstream 200/206 carries a stored `Content-Encoding` (not `identity`)
+   is not streamed (hub#585). The Workers runtime decodes such a body inside
+   `fetch()`, so the Worker reads the decoded body first. If the read fails, or it
+   yields 0 bytes while R2 sent a non-zero `content-length`, the object stores a
+   header that does not match its bytes (the hub#43 relocation copy did this to
+   svg/css/ttf). The Worker then logs `stored-content-encoding-mismatch` and returns
+   the bare 500, not an empty 200 with the immutable cache. The read is capped at
+   8 MiB (`MAX_DECODED_BODY_BYTES`): a larger decoded body is cancelled and refused the
+   same way (`reason=too-large`), because the stored encoding is tenant-controlled and
+   an unbounded read could exhaust the isolate. All concurrent reads in one isolate
+   share a 32 MiB budget (`MAX_BUFFERED_BYTES_PER_ISOLATE`, each chunk counts twice
+   for the final copy); a read that would pass it is cancelled and refused
+   (`reason=busy`), so parallel requests cannot exhaust the isolate either. On success it sends the
+   decoded bytes with their own `content-length` and no `content-encoding`. HEAD is
+   unchanged. Repair such objects with orchestrator's `npm run media-relocate --
+   --repair-encoding`.
+
 Every path is wrapped in a top-level try/catch that returns a bare 500 —
 `fetch()` never throws and never leaks internals to the client.
 

@@ -68,6 +68,10 @@ This is effectively a one-file Worker:
   read credential being masked by the shared bucket) and `not-found-in-both-buckets`
   (primary 404 + fallback 404). Keep both silent on primary-200 and on
   primary-404 → fallback-200, which is every request from an unmigrated site.
+  A third line, `stored-content-encoding-mismatch`, fires when an object with a stored
+  `Content-Encoding` fails to decode, decodes to 0 bytes, decodes past the 8 MiB cap, or would pass the 32 MiB per-isolate
+  buffer budget shared by concurrent reads
+  (`reason=decode-failed|empty-body|too-large|busy`, hub#585); that request gets a 500, never an empty 200 with the immutable cache.
 
 - **R2 key scheme is always `<slug>/<path>`, never anything else.** Shared-host
   requests already have the slug as the path's first segment (key = raw path);
